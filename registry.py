@@ -149,6 +149,34 @@ class Registry:
         self._children = dict()
         self._scope = self.infer_scope() if scope is None else scope
 
+        if build_func is None:
+            if parent is not None:
+                self.build_func = parent.build_func
+            else:
+                self.build_func = build_from_cfg
+        else:
+            self.build_func = build_func
+
+        if parent is not None:
+            assert isinstance(parent, Registry)
+            parent._add_children(self)
+            self.parent = parent
+        else:
+            self.parent = None
+
+
+    def __len__(self):
+        return len(self._module_dict)
+
+    def __contains__(self, item):
+        return self.get(item) is not None
+
+    def __repr__(self):
+        format_str = self.__class__.__name__ + \
+                     f'(name={self._name}, ' \
+                     f'items={self._module_dict})'
+        return format_str
+
     @staticmethod
     def infer_scope():
         """Infer the scope of registry.
@@ -173,4 +201,138 @@ class Registry:
         split_filename = filename.split('.')
         return split_filename[0]
 
+    @staticmethod
+    def split_scope_key(key):
+        """Split scope and key.
 
+        The first scope will be split from key.
+
+        Examples:
+            >>> Registry.split_scope_key('mmdet.ResNet')
+            'mmdet', 'ResNet'
+            >>> Registry.split_scope_key('ResNet')
+            None, 'ResNet'
+
+        Return:
+            tuple[str | None, str]: The former element is the first scope of
+            the key, which can be ``None``. The latter is the remaining key.
+        """
+        split_index = key.find('.')
+        if split_index != -1:
+            return key[:split_index], key[split_index + 1:]
+        else:
+            return None, key
+
+    @property
+    def name(self):
+        return self._scope
+
+    @property
+    def scope(self):
+        return self._scope
+
+    @property
+    def module_dict(self):
+        return self._module_dict
+
+    @property
+    def children(self):
+        return self._children
+
+    def get(self, key):
+        """Get the registry record.
+
+        Args:
+            key (str): The class name in string format.
+
+        Returns:
+            class: The corresponding class.
+        """
+        scope, real_key = self.split_scope_key(key)
+        if scope is None or scope == self._scope:
+            # get from self
+            if real_key in self._module_dict:
+                return self._module_dict[real_key]
+        else:
+            # gete from self._children
+            if scope in self._children:
+                return self._children[scope].get(real_key)
+            else:
+                # go to root.
+                parent = self.parent
+                while parent.parent is not None:
+                    parent = parent.parent
+                return parent.get(key)
+
+    def build(self, *args, **kwargs):
+        return self.build_func(*args, **kwargs, registry=self)
+
+    def _add_children(self, registry):
+        """Add children for a registry.
+
+        The `registry` will be added as children based on its scope.
+        The parent registry could build objects from children registry.
+
+        Example:
+            >>> models = Registry('models')
+            >>> mmdet_models = Registry('models', parent=models)
+            >>> @mmdet_models.register_module()
+            >>> class ResNet:
+            >>>     pass
+            >>> resnet = models.build(dict(type='mmdet.ResNet'))
+        """
+
+        assert isinstance(registry, Registry)
+        assert registry.scope is not None
+        assert registry.scope not in self.children, \
+            f'scope {registry.scope} exists in {self.name} registry'
+        self.children[registry.scope] = registry
+
+    @deprecated_api_warning(name_dict=dict(module_class='module'))
+    def _register_module(self, module, module_name=None, force=False):
+        if not inspect.isclass(module) and not inspect.isfunction(module):
+            raise TypeError('module must be a class or a function, '
+                            f'but got {type(module)}')
+        if module_name is None:
+            module_name = module.__name__
+        if isinstance(module_name, str):
+            module_name = [module_name]
+        for name in module_name:
+            if not force and name in self._module_dict:
+                raise KeyError(f'{name} is already registered '
+                               f'in {self.name}')
+            self._module_dict[name] = module
+
+    def deprecated_register_module(self, cls=None, force=False):
+        warnings.warn(
+            'The old API of register_module(module, force=False) '
+            'is deprecated and will be removed, please use the new API '
+            'register_module(name=None, force=False, module=None) instead.',
+            DeprecationWarning)
+        if cls is None:
+            return partial(self.deprecated_register_module, force=force)
+        self._register_module(cls, force=force)
+        return cls
+
+    def register_module(self, name=None, force=False, module=None):
+        if not isinstance(force, bool):
+            raise TypeError(f'force must be a boolean, but got {type(force)}')
+
+        if isinstance(name, type):
+            return self.deprecated_register_module(name, force=force)
+
+        if not (name is None or isinstance(name, str) or is_seq_of(name, str)):
+            raise TypeError(
+                'name must be either of None, an instance of str or a sequence'
+                f'  of str, but got {type(name)}')
+
+        if module is not None:
+            self._register_module(module=module, module_name=name, force=force)
+            return module
+
+        def _register(module):
+            self._register_module(module=module, module_name=name, force=force)
+            return module
+
+        return  _register
+    
